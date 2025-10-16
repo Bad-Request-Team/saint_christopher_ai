@@ -71,7 +71,7 @@ class AccurateGPUAggressiveDrivingDetector:
             'frame_size': None,
             'scale_factor': 1.0
         }
-        self.set_calibration(calibration_data=self.calibration_data)
+        # self.set_calibration(calibration_data=self.calibration_data)
 
     def set_calibration(self, calibration_data: Dict[str, Any]):
         """Установка калибровочных параметров"""
