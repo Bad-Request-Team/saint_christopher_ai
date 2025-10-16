@@ -4,6 +4,7 @@ import numpy as np
 from collections import defaultdict
 import logging
 from typing import Dict, Any
+from ultralytics import YOLO
 
 class AccurateGPUAggressiveDrivingDetector:
     def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
@@ -11,6 +12,28 @@ class AccurateGPUAggressiveDrivingDetector:
         self.logger = logging.getLogger(__name__)
         self.device = device
         self.logger.info(f"Using device: {device}")
+        self.model = YOLO("yolo11n.pt")
+        self.model.to(self.device)
+        self.model.eval()
+        self.stats = {
+            "total_count": 0,
+            "aggressive_count": 0,
+            "acc_count": 0,
+            "br_count": 0,
+            "lane_count": 0,
+            "avg_speed": 0,
+            "avg_acc": 0,
+            "avg_angle": 0
+        }
+
+        self.helping_data = {
+            "sum_speed": 0,
+            "sum_acc": 0,
+            "sum_angle": 0,
+            "count_speed": 0,
+            "count_acc": 0,
+            "count_angle": 0
+        }
 
         self.track_history = defaultdict(lambda: {
             'positions': torch.zeros((120, 2), device=self.device),
@@ -41,13 +64,14 @@ class AccurateGPUAggressiveDrivingDetector:
         self.calibration_points = []
         self.calibration_complete = False
         self.real_world_size = None
-        self.meters_per_pixel_x = 1.0
-        self.meters_per_pixel_y = 1.0
+        self.meters_per_pixel_x = 50
+        self.meters_per_pixel_y = 150
 
         self.calibration_data = {
             'frame_size': None,
             'scale_factor': 1.0
         }
+        self.set_calibration(calibration_data=self.calibration_data)
 
     def set_calibration(self, calibration_data: Dict[str, Any]):
         """Установка калибровочных параметров"""
@@ -140,6 +164,9 @@ class AccurateGPUAggressiveDrivingDetector:
             track_data['world_speed'] = median_speed
             track_data['is_calibrated'] = True
             track_data['speed_history'][0] = median_speed
+            self.helping_data['sum_speed'] += median_speed
+            self.helping_data["count_speed"] += 1
+            self.stats["avg_speed"] = self.helping_data['sum_speed'] / self.helping_data["count"]
             track_data['speed_history_count'] = 1
 
     def calculate_world_metrics(self, track_data):
@@ -205,10 +232,16 @@ class AccurateGPUAggressiveDrivingDetector:
                             smooth_factor * track_data['world_acceleration'] +
                             (1 - smooth_factor) * acceleration
                     )
+                    self.helping_data['sum_acc'] += track_data['world_acceleration']
+                    self.helping_data["count_acc"] += 1
+                    self.stats["avg_acc"] = self.helping_data['sum_acc'] / self.helping_data["count_acc"]
                     return current_speed, track_data['world_acceleration']
 
             return current_speed, torch.tensor(0.0, device=self.device)
 
+        self.helping_data['sum_speed'] += track_data['world_speed']
+        self.helping_data["count_speed"] += 1
+        self.stats["avg_speed"] = self.helping_data['sum_speed'] / self.helping_data["count_speed"]
         return track_data['world_speed'], torch.tensor(0.0, device=self.device)
 
     def detect_lane_change_robust(self, track_data):
@@ -236,6 +269,8 @@ class AccurateGPUAggressiveDrivingDetector:
                                       angle_change_23 > self.LANE_CHANGE_ANGLE_THRESHOLD and
                                       torch.sign(angle1 - angle2) == torch.sign(angle2 - angle3))
 
+                if significant_change:
+                    self.stats['lane_count'] += 1
                 return significant_change
 
         return False
@@ -268,6 +303,10 @@ class AccurateGPUAggressiveDrivingDetector:
         else:
             angle = torch.tensor(90.0 if dy > 0 else -90.0, device=self.device)
 
+        self.helping_data['sum_angle'] += angle
+        self.helping_data["count_angle"] += 1
+        self.stats["avg_angle"] = self.helping_data['sum_angle'] / self.helping_data["count_angle"]
+
         return angle
 
     def detect_aggressive_behavior(self, track_data, track_id, current_frame):
@@ -294,21 +333,102 @@ class AccurateGPUAggressiveDrivingDetector:
                     if track_data['aggressive_count'] == 0 or \
                             (current_frame - track_data['last_aggressive_frame']) > 60:
                         behaviors.append("HARD_BRAKING")
+                        self.stats["br_count"] += 1
 
             # Ускорение
             elif acceleration_value > self.ACCELERATION_THRESHOLD.item():
                 if speed_kmh > 30.0 and track_data['aggressive_count'] == 0:
                     behaviors.append("HARD_ACCELERATION")
+                    self.stats["acc_count"] += 1
 
         # Смена полосы
         if self.detect_lane_change_robust(track_data):
             if current_frame - track_data['last_aggressive_frame'] > 90:
                 behaviors.append("AGGRESSIVE_LANE_CHANGE")
+                self.stats["lane_count"] += 1
 
         is_aggressive = len(behaviors) > 0
 
         if is_aggressive and (current_frame - track_data['last_aggressive_frame'] > 45):
             track_data['aggressive_count'] += 1
             track_data['last_aggressive_frame'] = current_frame
+            self.stats['aggressive_count'] += 1
 
         return is_aggressive, behaviors
+
+    def detect_aggressive_behavior_robust(self, track_data, current_frame):
+        """Надёжная детекция агрессивного поведения"""
+        if track_data['count'] < self.MIN_TRACK_LENGTH or not track_data['is_calibrated']:
+            return False, []
+
+        speed, acceleration = self.calculate_world_metrics(track_data)
+        behaviors = []  # Переводим в км/ч для проверки
+        speed_kmh = speed.item() * 3.6 if speed.numel() == 1 else 0.0
+        acceleration_value = acceleration.item() if acceleration.numel() == 1 else 0.0
+
+        # ФИЛЬТР НЕРЕАЛИСТИЧНЫХ СКОРОСТЕЙ
+        if speed_kmh > 250.0 or speed_kmh < 1.0:
+            return False, []
+
+        # КОНСЕРВАТИВНЫЕ ПРОВЕРКИ
+
+        # 1. Ускорение/торможение - требуем значительных изменений
+        acceleration_significant = abs(acceleration_value) > 1.5
+
+        if acceleration_significant:
+            # Торможение - строгие условия
+            if acceleration_value < self.DECELERATION_THRESHOLD.item():
+                # Дополнительные проверки:
+                # - Высокая исходная скорость
+                # - Устойчивое торможение
+                if speed_kmh > 50.0:  # > 50 км/ч
+                    if track_data['aggressive_count'] == 0 or \
+                            (current_frame - track_data['last_aggressive_frame']) > 60:
+                        behaviors.append("REZKOE_TORMOZHENIE")
+                        self.stats["br_count"] += 1
+
+            # Ускорение - строгие условия
+            elif acceleration_value > self.ACCELERATION_THRESHOLD.item():
+                if speed_kmh > 30.0 and track_data['aggressive_count'] == 0:
+                    behaviors.append("RESKOE_USKORENIE")
+                    self.stats["acc_count"] += 1
+
+        # 2. Смена полосы - надежная детекция
+        if self.detect_lane_change_robust(track_data):
+            # Только если не было недавних агрессивных событий
+            if current_frame - track_data['last_aggressive_frame'] > 90:
+                behaviors.append("REZKOE_PERESTROENIE")
+                self.stats["lane_count"] += 1
+
+        is_aggressive = len(behaviors) > 0
+
+        # Консервативное обновление счетчиков
+        if is_aggressive and (current_frame - track_data['last_aggressive_frame'] > 45):
+            track_data['aggressive_count'] += 1
+            track_data['last_aggressive_frame'] = current_frame
+            self.stats['aggressive_count'] += 1
+
+        return is_aggressive, behaviors
+    def predict_aggressive_behavior(self, current_frame, frame_count):
+        results = self.model.track(
+            current_frame, persist=True, tracker="bytetrack.yaml",
+            classes=[2, 3, 5, 7], conf=0.25, verbose=False, device=self.device
+        )
+
+        if results[0].boxes is not None and results[0].boxes.id is not None:
+            boxes = results[0].boxes.xywh.cpu()
+            track_ids = results[0].boxes.id.int().cpu().tolist()
+            confidences = results[0].boxes.conf.float().cpu().tolist()
+
+            for box, track_id, conf in zip(boxes, track_ids, confidences):
+                x, y, w, h = box
+                center = torch.tensor([float(x), float(y)], device=self.device)
+
+                self.update_track_history(track_id, center, torch.tensor(1, device=self.device))
+
+                track_data = self.track_history[track_id]
+                is_aggressive, behaviors = self.detect_aggressive_behavior_robust(
+                    track_data, frame_count
+                )
+
+                return self.stats

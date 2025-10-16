@@ -1,9 +1,13 @@
-import json
+import asyncio
 import websockets
+from websockets import ClientConnection
 import logging
 from typing import Dict, Optional
-import base64
 import uuid
+import numpy
+import json
+
+from DetecorService.Detecor import AccurateGPUAggressiveDrivingDetector
 
 
 class WebSocketClient:
@@ -11,44 +15,32 @@ class WebSocketClient:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
         self.uri = uri
-        self.websocket = None
+        self.websocket: ClientConnection = None
         self.is_connected = False
         self.client_id = str(uuid.uuid4())[:8]
+        self.detector = AccurateGPUAggressiveDrivingDetector()
 
     async def connect(self):
-        """Подключение к WebSocket серверу"""
         try:
-            self.websocket = await websockets.connect(self.uri)
-            self.is_connected = True
-            self.logger.info(f"Connected to WebSocket server {self.uri}")
-            return True
+            self.websocket = websockets.connect(self.uri)
+            while True:
+                await self.update_socket()
+                await asyncio.sleep(0.1)
         except Exception as e:
             self.logger.error(f"Failed to connect to WebSocket server: {e}")
             return False
 
-    async def send_frame(self, frame_data: bytes) -> Optional[Dict]:
-        """Отправка кадра и получение результата"""
+    async def update_socket(self) -> Optional[Dict]:
         if not self.is_connected or not self.websocket:
-            if not await self.connect():
-                return None
-
-        try:
-            # Кодируем кадр в base64
-            frame_b64 = base64.b64encode(frame_data).decode('utf-8')
-            await self.websocket.send(frame_b64)
-
-            # Получаем ответ
-            response = await self.websocket.recv()
-            result = json.loads(response)
-            return result
-
-        except Exception as e:
-            self.logger.error(f"Error in WebSocket communication: {e}")
-            self.is_connected = False
             return None
 
+        data = await self.websocket.recv()
+        data = json.loads(data)
+        array = numpy.frombuffer(data["frame"], numpy.uint8)
+        stats = self.detector.predict_aggressive_behavior(array, data["frame_id"])
+        await self.websocket.send(json.dumps(stats))
+
     async def close(self):
-        """Закрытие соединения"""
         if self.websocket:
             await self.websocket.close()
             self.is_connected = False

@@ -2,7 +2,6 @@ import cv2
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from ultralytics import YOLO
 import logging
 from typing import Dict, Any, Optional
 

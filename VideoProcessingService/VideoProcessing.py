@@ -9,7 +9,7 @@ from WebSocketClientService.WebSocketClient import WebSocketClient
 
 
 class VideoProcessingService:
-    def __init__(self, websocket_uri: str = "ws://localhost:8000/ws/video-analysis"):
+    def __init__(self, websocket_uri: str = "ws://127.0.0.1:5000/neural_ws"):
         self.detector = AccurateGPUAggressiveDrivingDetector()
         self.model = YOLO("yolo11n.pt")
         self.model.model.to(self.detector.device)
@@ -26,7 +26,7 @@ class VideoProcessingService:
         """Запуск WebSocket клиента"""
         return await self.ws_client.connect()
 
-    async def process_video_stream(self, video_source: str = "0"):
+    async def process_img(self, image: bytes):
         """
         Обработка видео потока и отправка через WebSocket
 
@@ -52,7 +52,7 @@ class VideoProcessingService:
                 jpeg_data = buffer.tobytes()
 
                 # Отправка через WebSocket
-                result = await self.ws_client.send_frame(jpeg_data)
+                result = self.detector.predict_aggressive_behavior()
 
                 if result:
                     self.analysis_results = result
